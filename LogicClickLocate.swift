@@ -1,163 +1,173 @@
-// Logic Click Locate — a plain left-click on an empty track lane in Logic Pro moves the playhead there.
+// Logic Click Locate — a quick plain tap in Logic Pro's Tracks area moves the playhead there.
 //
 // Logic 12.4 broke Shift-click-to-locate in the Tracks area; clicking the ruler still works. This helper
-// watches left-clicks while Logic is frontmost. If a click (no modifiers, no drag) lands on an empty
-// track lane — Logic's accessibility tree reports an AXLayoutArea whose help text starts with
-// "Workspace" (regions are AXLayoutItem children, so they never match) — it posts a click on the lower
-// half of the Tracks ruler at the same x, then puts the cursor back.
+// polls the left mouse button; after a quick, still, unmodified single tap inside the Tracks area it clicks the
+// ruler at the same x and puts the cursor back.
+//
+// It NEVER talks to Logic through accessibility: any accessibility query to Logic 12.4 breaks drag-select and
+// region dragging until Logic restarts (proven 2026-10-21). So it cannot tell empty lanes from regions — a quick
+// tap on a region also locates — and it finds the ruler and Tracks area from Logic's window frame
+// (CGWindowList, no accessibility) plus offsets in layout.json.
 
 import Cocoa
-import ApplicationServices
 
 let logicBundleID = "com.apple.logic10"
-let syntheticTag: Int64 = 0x4C434C4F // "LCLO": marks our own events so the tap ignores them
 let dragSlop: CGFloat = 4
 
-// MARK: - Accessibility helpers
+// Diagnostic log (~/Library/Logs/LogicClickLocate.log): every click the helper sees and every action it takes.
+let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/LogicClickLocate.log")
+let logFormatter: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"; return f }()
+func dlog(_ msg: String) {
+    let line = "\(logFormatter.string(from: Date())) \(msg)\n"
+    if let h = try? FileHandle(forWritingTo: logURL) { h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close() }
+    else { try? line.write(to: logURL, atomically: true, encoding: .utf8) }
+}
+func pt(_ p: CGPoint) -> String { "\(Int(p.x)),\(Int(p.y))" }
 
-func axAttr(_ e: AXUIElement, _ a: String) -> AnyObject? {
-    var v: AnyObject?
-    return AXUIElementCopyAttributeValue(e, a as CFString, &v) == .success ? v : nil
+// MARK: - Layout (window-relative offsets, editable in layout.json)
+
+struct Layout: Codable {
+    /// y of the ruler's lower (locate) half, from the top of Logic's main window
+    var rulerYFromWindowTop: CGFloat = 154
+    /// the Tracks area (where taps count): left edge from window left, top from window top,
+    /// and margins kept clear at the right (scroll bar) and bottom
+    var tracksLeftFromWindowLeft: CGFloat = 566
+    var tracksTopFromWindowTop: CGFloat = 166
+    var tracksRightMargin: CGFloat = 20
+    var tracksBottomMargin: CGFloat = 20
+    /// how long to wait for a possible second click before locating (a second click cancels). Shorter feels
+    /// snappier; a double-click on a region slower than this won't reach Logic as a double-click.
+    var locateDelay: Double = 0.25
 }
 
-func axString(_ e: AXUIElement, _ a: String) -> String { axAttr(e, a) as? String ?? "" }
+let layoutURL = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/LogicClickLocate/layout.json")
 
-func axFrame(_ e: AXUIElement) -> CGRect? {
-    guard let p = axAttr(e, kAXPositionAttribute), let s = axAttr(e, kAXSizeAttribute) else { return nil }
-    var pt = CGPoint.zero, sz = CGSize.zero
-    AXValueGetValue(p as! AXValue, .cgPoint, &pt)
-    AXValueGetValue(s as! AXValue, .cgSize, &sz)
-    return CGRect(origin: pt, size: sz)
-}
-
-func axParent(_ e: AXUIElement) -> AXUIElement? {
-    guard let p = axAttr(e, kAXParentAttribute) else { return nil }
-    return (p as! AXUIElement)
-}
-
-/// The element of Logic under a screen point (top-left origin coordinates).
-func logicElement(at p: CGPoint, pid: pid_t) -> AXUIElement? {
-    var el: AXUIElement?
-    let app = AXUIElementCreateApplication(pid)
-    guard AXUIElementCopyElementAtPosition(app, Float(p.x), Float(p.y), &el) == .success else { return nil }
-    return el
-}
-
-/// Empty track lane = the lane itself (or the empty area below the last track), not a region inside it.
-func isEmptyLane(_ e: AXUIElement) -> Bool {
-    axString(e, kAXRoleAttribute) == "AXLayoutArea" && axString(e, kAXHelpAttribute).hasPrefix("Workspace")
-}
-
-func window(of e: AXUIElement) -> AXUIElement? {
-    var cur: AXUIElement? = e
-    while let c = cur {
-        if axString(c, kAXRoleAttribute) == kAXWindowRole { return c }
-        cur = axParent(c)
+/// Logic's main window (largest normal-level window of Logic containing the point), from CGWindowList.
+func logicWindowFrame(containing p: CGPoint, pid: pid_t) -> CGRect? {
+    guard let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return nil }
+    let frames = infos.compactMap { i -> CGRect? in
+        guard (i[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
+              (i[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+              let b = i[kCGWindowBounds as String] as! CFDictionary?, let r = CGRect(dictionaryRepresentation: b) else { return nil }
+        return r
     }
-    return nil
-}
-
-/// Breadth-first search for the Tracks time ruler inside a window.
-func findRuler(in win: AXUIElement) -> AXUIElement? {
-    var queue: [AXUIElement] = [win]
-    var visited = 0
-    while !queue.isEmpty && visited < 4000 {
-        let e = queue.removeFirst()
-        visited += 1
-        if axString(e, kAXRoleAttribute) == "AXLayoutArea" && axString(e, kAXDescriptionAttribute) == "Tracks time ruler" {
-            return e
-        }
-        // Don't descend into lanes, regions or the mixer: the ruler sits beside them, not inside.
-        if axString(e, kAXDescriptionAttribute) == "Mixer" || isEmptyLane(e) { continue }
-        if let kids = axAttr(e, kAXChildrenAttribute) as? [AXUIElement] { queue.append(contentsOf: kids) }
-    }
-    return nil
+    return frames.filter { $0.contains(p) }.max { $0.width * $0.height < $1.width * $1.height }
 }
 
 // MARK: - Click handling
 
 final class ClickLocator {
     var enabled = true
-    private var pendingDown: CGPoint?
-    private var pendingWindow: AXUIElement?
-    private var rulerCache: [CFHashCode: AXUIElement] = [:]
+    var layout = Layout()
+    private let maxClickDuration: TimeInterval = 0.2 // anything held longer than a quick tap never locates
     private let source: CGEventSource? = {
         let s = CGEventSource(stateID: .hidSystemState)
-        s?.localEventsSuppressionInterval = 0 // don't swallow the user's real mouse movement after our events
+        s?.localEventsSuppressionInterval = 0
         return s
     }()
+
+    func loadLayout() {
+        if let d = try? Data(contentsOf: layoutURL), let l = try? JSONDecoder().decode(Layout.self, from: d) { layout = l; return }
+        try? FileManager.default.createDirectory(at: layoutURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try? enc.encode(layout).write(to: layoutURL)
+    }
 
     private func logicPID() -> pid_t? {
         guard let front = NSWorkspace.shared.frontmostApplication, front.bundleIdentifier == logicBundleID else { return nil }
         return front.processIdentifier
     }
 
-    func handle(_ type: CGEventType, _ event: CGEvent) {
-        if event.getIntegerValueField(.eventSourceUserData) == syntheticTag {
-            if type == .leftMouseUp { DispatchQueue.main.async { self.restoreCursor() } }
-            return
-        }
-        guard enabled else { return }
-        switch type {
-        case .leftMouseDown:
-            pendingDown = nil
+    // MARK: Button polling (no event tap)
+    private var wasDown = false
+    private var downAt = CGPoint.zero
+    private var downTime = Date.distantPast
+    private var maxMove: CGFloat = 0
+    private var trackingClick = false
+    private var pressCount = 0          // bumps on every real press; a pending locate is cancelled if it changes
+    private var ignoreUntil = Date.distantPast // our own ruler click shows up in the button state too
+
+    func poll() {
+        let down = CGEventSource.buttonState(.combinedSessionState, button: .left)
+        guard let loc = CGEvent(source: nil)?.location else { return }
+        if Date() < ignoreUntil { wasDown = down; return }
+        if down && !wasDown {
+            pressCount += 1
             let mods: CGEventFlags = [.maskCommand, .maskShift, .maskAlternate, .maskControl]
-            guard event.flags.intersection(mods).isEmpty,
-                  event.getIntegerValueField(.mouseEventClickState) == 1,
-                  let pid = logicPID(),
-                  let el = logicElement(at: event.location, pid: pid),
-                  isEmptyLane(el) else { return }
-            pendingDown = event.location
-            pendingWindow = window(of: el)
-        case .leftMouseDragged:
-            if let d = pendingDown, hypot(event.location.x - d.x, event.location.y - d.y) > dragSlop { pendingDown = nil }
-        case .leftMouseUp:
-            guard let d = pendingDown, let win = pendingWindow else { return }
-            pendingDown = nil
-            let back = event.location
-            // Let Logic finish handling the real click first.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { self.locate(x: d.x, window: win, restoreTo: back) }
-        default:
-            break
+            trackingClick = enabled && logicPID() != nil
+                && CGEventSource.flagsState(.combinedSessionState).intersection(mods).isEmpty
+            downAt = loc; maxMove = 0; downTime = Date()
+        } else if down && trackingClick {
+            maxMove = max(maxMove, hypot(loc.x - downAt.x, loc.y - downAt.y))
+        } else if !down && wasDown {
+            let held = Date().timeIntervalSince(downTime)
+            if trackingClick {
+                maxMove = max(maxMove, hypot(loc.x - downAt.x, loc.y - downAt.y))
+                if held < maxClickDuration && maxMove <= dragSlop {
+                    scheduleLocate(at: downAt, back: loc)
+                } else {
+                    dlog("press \(pt(downAt)) \(Int(held * 1000)) ms, moved \(Int(maxMove)) px -> ignored (hold/drag)")
+                }
+            }
+            trackingClick = false
         }
+        wasDown = down
     }
 
-    private func ruler(for win: AXUIElement) -> AXUIElement? {
-        let key = CFHash(win)
-        if let r = rulerCache[key], axFrame(r) != nil { return r }
-        let r = findRuler(in: win)
-        rulerCache[key] = r
-        return r
-    }
-
-    private func locate(x: CGFloat, window win: AXUIElement, restoreTo back: CGPoint) {
-        guard let r = ruler(for: win), let f = axFrame(r), x >= f.minX, x <= f.maxX else { return }
-        // Lower part of the ruler = locate; the top strip is the cycle area.
-        let target = CGPoint(x: x, y: f.minY + f.height * 0.78)
-        // Logic ignores clicks posted straight to its pid, so this goes through the HID stream, which moves the
-        // cursor. Warp it back; re-associating mouse and cursor straight after cancels the ~0.25 s freeze a warp causes.
-        // The warp waits until our mouse-up has come back through the tap: warping straight after posting
-        // sometimes ran before the posted click moved the cursor, leaving it on the ruler.
-        restorePoint = back
-        post(.leftMouseDown, at: target)
-        post(.leftMouseUp, at: target)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.restoreCursor() } // fallback
+    /// Wait out the double-click interval first: locating between the two clicks of a double-click would
+    /// put our ruler click in the middle and Logic would never see the double-click (e.g. opening a region).
+    private func scheduleLocate(at d: CGPoint, back: CGPoint) {
+        let presses = pressCount
+        let wait = max(0.05, min(layout.locateDelay, NSEvent.doubleClickInterval))
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
+            guard self.pressCount == presses else { dlog("tap \(pt(d)) -> cancelled (another click followed)"); return }
+            // Moving the mouse during the wait is normal; only a button that is down again stops us.
+            guard !CGEventSource.buttonState(.combinedSessionState, button: .left),
+                  let now = CGEvent(source: nil)?.location else {
+                dlog("tap \(pt(d)) -> skipped (button pressed again)"); return }
+            guard let pid = self.logicPID(), let w = logicWindowFrame(containing: d, pid: pid) else {
+                dlog("tap \(pt(d)) -> skipped (not Logic's window)"); return }
+            let l = self.layout
+            let area = CGRect(x: w.minX + l.tracksLeftFromWindowLeft, y: w.minY + l.tracksTopFromWindowTop,
+                              width: w.width - l.tracksLeftFromWindowLeft - l.tracksRightMargin,
+                              height: w.height - l.tracksTopFromWindowTop - l.tracksBottomMargin)
+            guard area.contains(d) else { dlog("tap \(pt(d)) -> skipped (outside Tracks area \(Int(area.minX)),\(Int(area.minY)) \(Int(area.width))x\(Int(area.height)))"); return }
+            self.clickRuler(x: d.x, y: w.minY + l.rulerYFromWindowTop, back: now) // cursor goes back to where it is now
+        }
     }
 
     private var restorePoint: CGPoint?
 
-    func restoreCursor() {
-        guard let back = restorePoint else { return }
-        restorePoint = nil
-        CGWarpMouseCursorPosition(back)
-        CGAssociateMouseAndMouseCursorPosition(1)
+    private func clickRuler(x: CGFloat, y: CGFloat, back: CGPoint) {
+        let target = CGPoint(x: x, y: y)
+        dlog("tap -> ruler click at \(pt(target))")
+        restorePoint = back
+        ignoreUntil = Date().addingTimeInterval(0.3)
+        post(.leftMouseDown, at: target)
+        post(.leftMouseUp, at: target)
+        waitForCursor(at: target, deadline: Date().addingTimeInterval(0.1))
+    }
+
+    /// Warp back once the posted click has actually moved the cursor to the ruler.
+    private func waitForCursor(at target: CGPoint, deadline: Date) {
+        let now = CGEvent(source: nil)?.location ?? target
+        if hypot(now.x - target.x, now.y - target.y) < 2 || Date() > deadline {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.005) {
+                guard let back = self.restorePoint else { return }
+                self.restorePoint = nil
+                CGWarpMouseCursorPosition(back)
+                CGAssociateMouseAndMouseCursorPosition(1)
+            }
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.002) { self.waitForCursor(at: target, deadline: deadline) }
+        }
     }
 
     private func post(_ type: CGEventType, at p: CGPoint) {
         guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: .left) else { return }
         e.flags = []
-        e.setIntegerValueField(.eventSourceUserData, value: syntheticTag)
-        if type != .mouseMoved { e.setIntegerValueField(.mouseEventClickState, value: 1) }
+        e.setIntegerValueField(.mouseEventClickState, value: 1)
         e.post(tap: .cghidEventTap)
     }
 }
@@ -167,7 +177,6 @@ final class ClickLocator {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let locator = ClickLocator()
     var statusItem: NSStatusItem!
-    var tap: CFMachPort?
     var toggleItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -182,36 +191,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
         refreshIcon()
 
+        // Posting the ruler click needs this app's own Accessibility permission (macOS's rule for sending
+        // events). That is a local check only: nothing here ever queries Logic through accessibility.
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        if !AXIsProcessTrustedWithOptions(opts) {
-            // macOS shows its own prompt; keep retrying until Accessibility is granted.
-            Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { t in
-                if AXIsProcessTrusted() { t.invalidate(); self.startTap() }
-            }
-        } else {
-            startTap()
-        }
+        _ = AXIsProcessTrustedWithOptions(opts)
+        locator.loadLayout()
+        startPolling()
     }
 
-    func startTap() {
-        let mask = (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.leftMouseUp.rawValue)
-            | (1 << CGEventType.leftMouseDragged.rawValue)
-        let callback: CGEventTapCallBack = { _, type, event, refcon in
-            let me = Unmanaged<AppDelegate>.fromOpaque(refcon!).takeUnretainedValue()
-            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                if let t = me.tap { CGEvent.tapEnable(tap: t, enable: true) }
-            } else {
-                me.locator.handle(type, event)
-            }
-            return Unmanaged.passUnretained(event)
-        }
-        tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
-                                eventsOfInterest: CGEventMask(mask), callback: callback,
-                                userInfo: Unmanaged.passUnretained(self).toOpaque())
-        guard let tap else { NSLog("LogicClickLocate: could not create event tap"); return }
-        let src = CFMachPortCreateRunLoopSource(nil, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
+    /// Polls the left button 100 times a second (see ClickLocator.poll for why there is no event tap).
+    func startPolling() {
+        let t = Timer(timeInterval: 0.01, repeats: true) { [weak self] _ in self?.locator.poll() }
+        RunLoop.main.add(t, forMode: .common)
+        dlog("started (polling, no event tap)")
     }
 
     @objc func toggle() {

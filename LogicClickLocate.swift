@@ -66,47 +66,95 @@ func logicMainWindowFrame(topmostAt p: CGPoint, pid: pid_t) -> CGRect? {
     return main
 }
 
-/// Is a docked editor or mixer between the top of the Tracks area and the tap? Logic draws an unbroken black line
+/// Where did a tap land: track lanes, track headers/side panels, or a docked editor/mixer?
+///
+/// Docked editor or mixer between the top of the Tracks area and the tap: Logic draws an unbroken black line
 /// above a docked editor/mixer from the left of the track headers to the window's right edge. Region borders are
 /// also black but are broken by the bar grid and stop at the scroll bar, so they never reach the window edge
 /// (checked 2026-10-22 with and without Library/Inspector open). Reads screen pixels (ScreenCaptureKit, needs
 /// Screen Recording) — never accessibility. Thin columns are captured at full resolution (the line is 1 pt): one
 /// at the window's right edge plus six across the right half of the window (the left side may be Library/Inspector);
 /// a row black in all of them is the divider.
-/// done(true) = tap is below the divider, false = no divider above it, nil = capture failed (e.g. no permission).
-func tapIsBelowEditorDivider(_ d: CGPoint, in area: CGRect, window w: CGRect, done: @escaping (Bool?) -> Void) {
-    let height = d.y - area.minY
-    guard height >= 2 else { done(false); return }
-    let edge = CGRect(x: w.maxX - 3, y: area.minY, width: 2, height: height)
-    let columns = [edge] + (0..<6).map { i in CGRect(x: w.midX + (w.width / 2 - 40) * CGFloat(i) / 5, y: area.minY, width: 2, height: height) }
+///
+/// Track headers: at the ruler's height the track-header column is one flat mid-grey block (about 63; reads ~10
+/// brighter through ScreenCaptureKit) ending exactly where the lanes and ruler (45 or darker) start. The Library and
+/// Inspector, when open, sit further left. So the lanes start where the rightmost flat-grey run left of the tap ends;
+/// no such run, or the tap on/inside it, means the tap is on a track header or a side panel (checked 2026-10-22 on
+/// both layouts: runs end at 564 and 1139, the real lane edges).
+enum TapPlace { case lanes, headers, editor }
+
+/// done(place), or nil if the screen capture failed (e.g. no Screen Recording permission).
+func classifyTap(_ d: CGPoint, in area: CGRect, window w: CGRect, rulerY: CGFloat, done: @escaping (TapPlace?) -> Void) {
     Task {
         do {
-            var blackRows: Set<Int>? = nil
-            var seen: [String] = [] // per column: image height and black-row count, for the log
-            for rect in columns {
-                let img = try await SCScreenshotManager.captureImage(in: rect)
-                let rows = blackRowIndices(img)
-                seen.append("\(img.height)h/\(rows.count)b")
-                blackRows = blackRows.map { $0.intersection(rows) } ?? rows
-                if blackRows!.isEmpty { break }
-            }
-            let found = !(blackRows ?? []).isEmpty
-            if !found { dlog("tap \(pt(d)) editor check: no divider above (columns \(seen.joined(separator: " ")))") }
-            DispatchQueue.main.async { done(found) }
+            let place = try await tapPlace(d, in: area, window: w, rulerY: rulerY)
+            DispatchQueue.main.async { done(place) }
         } catch {
-            dlog("tap \(pt(d)) editor check: capture error \(error)")
+            dlog("tap \(pt(d)) screen check: capture error \(error)")
             DispatchQueue.main.async { done(nil) }
         }
     }
 }
 
-/// Rows of the image whose middle pixel is black (or nearly).
-func blackRowIndices(_ img: CGImage) -> Set<Int> {
+func tapPlace(_ d: CGPoint, in area: CGRect, window w: CGRect, rulerY: CGFloat) async throws -> TapPlace {
+    // Track headers / side panels: find the lanes' left edge on the ruler row.
+    let row = try await SCScreenshotManager.captureImage(in: CGRect(x: w.minX, y: rulerY, width: d.x - w.minX, height: 2))
+    let scale = CGFloat(row.width) / (d.x - w.minX)
+    let (px, rw, rh) = rgbaPixels(row)
+    var lanesLeft: CGFloat? = nil
+    var runStart: Int? = nil
+    let y = rh / 2
+    for x in 0...rw {
+        var g = false
+        if x < rw {
+            let o = (y * rw + x) * 4
+            let r = px[o], gg = px[o + 1], b = px[o + 2]
+            g = max(r, gg, b) - min(r, gg, b) <= 4 && (60...85).contains(r)
+        }
+        if g, runStart == nil { runStart = x }
+        if !g, let s = runStart {
+            // the ruler's own greys stay under ~13 pt per stretch; the header column is ~330 pt wide
+            if CGFloat(x - s) >= 40 * scale { lanesLeft = w.minX + CGFloat(x) / scale }
+            runStart = nil
+        }
+    }
+    // tap straight below the header grey (however short the stretch so far) = on a header
+    let last = (y * rw + rw - 1) * 4
+    let tapOnGrey = max(px[last], px[last + 1], px[last + 2]) - min(px[last], px[last + 1], px[last + 2]) <= 4
+        && (60...85).contains(px[last])
+    guard !tapOnGrey, let left = lanesLeft, d.x >= left + 3 else {
+        dlog("tap \(pt(d)) -> on track headers/side panel (lanes start at \(lanesLeft.map { "\(Int($0))" } ?? "?"))")
+        return .headers
+    }
+
+    // Docked editor/mixer: a black row in every column between the Tracks-area top and the tap.
+    let height = d.y - area.minY
+    guard height >= 2 else { return .lanes }
+    let edge = CGRect(x: w.maxX - 3, y: area.minY, width: 2, height: height)
+    let columns = [edge] + (0..<6).map { i in CGRect(x: w.midX + (w.width / 2 - 40) * CGFloat(i) / 5, y: area.minY, width: 2, height: height) }
+    var blackRows: Set<Int>? = nil
+    for rect in columns {
+        let rows = blackRowIndices(try await SCScreenshotManager.captureImage(in: rect))
+        blackRows = blackRows.map { $0.intersection(rows) } ?? rows
+        if blackRows!.isEmpty { break }
+    }
+    return (blackRows ?? []).isEmpty ? .lanes : .editor
+}
+
+/// The image's pixels as RGBA bytes, with its width and height.
+func rgbaPixels(_ img: CGImage) -> ([UInt8], Int, Int) {
     let w = img.width, h = img.height
     var buf = [UInt8](repeating: 0, count: w * h * 4)
-    guard let ctx = CGContext(data: &buf, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
-                              space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return [] }
-    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+    if let ctx = CGContext(data: &buf, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                           space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+    }
+    return (buf, w, h)
+}
+
+/// Rows of the image whose middle pixel is black (or nearly).
+func blackRowIndices(_ img: CGImage) -> Set<Int> {
+    let (buf, w, h) = rgbaPixels(img)
     var rows = Set<Int>()
     for r in 0..<h {
         let o = (r * w + w / 2) * 4
@@ -182,10 +230,10 @@ final class ClickLocator {
         wasDown = down
     }
 
-    /// Wait out the double-click interval first: locating between the two clicks of a double-click would
-    /// put our ruler click in the middle and Logic would never see the double-click (e.g. opening a region).
     private var warnedNoCapture = false
 
+    /// Wait out the double-click interval first: locating between the two clicks of a double-click would
+    /// put our ruler click in the middle and Logic would never see the double-click (e.g. opening a region).
     private func scheduleLocate(at d: CGPoint, back: CGPoint, window w: CGRect) {
         let presses = pressCount
         let wait = max(0.05, min(layout.locateDelay, NSEvent.doubleClickInterval))
@@ -195,25 +243,26 @@ final class ClickLocator {
                           height: w.height - l.tracksTopFromWindowTop - l.tracksBottomMargin)
         guard area.contains(d) else { dlog("tap \(pt(d)) -> skipped (outside Tracks area \(Int(area.minX)),\(Int(area.minY)) \(Int(area.width))x\(Int(area.height)))"); return }
 
-        // The editor check (screen capture) runs during the double-click wait; locate once both are done.
+        // The screen check (track headers, docked editor) runs during the double-click wait; locate once both are done.
         var waited = false
-        var belowEditor: Bool?? = .none // .none = capture still running
+        var checked: TapPlace?? = .none // .none = capture still running
         func finish() {
-            guard waited, let below = belowEditor else { return }
+            guard waited, let place = checked else { return }
             guard self.pressCount == presses else { dlog("tap \(pt(d)) -> cancelled (another click followed)"); return }
             // Moving the mouse during the wait is normal; only a button that is down again stops us.
             guard !CGEventSource.buttonState(.combinedSessionState, button: .left),
                   let now = CGEvent(source: nil)?.location else {
                 dlog("tap \(pt(d)) -> skipped (button pressed again)"); return }
             guard self.logicPID() != nil else { dlog("tap \(pt(d)) -> skipped (Logic not frontmost)"); return }
-            if below == true { dlog("tap \(pt(d)) -> skipped (in the docked editor/mixer)"); return }
-            if below == nil, !warnedNoCapture {
+            if place == .editor { dlog("tap \(pt(d)) -> skipped (in the docked editor/mixer)"); return }
+            if place == .headers { dlog("tap \(pt(d)) -> skipped (track headers/side panel)"); return }
+            if place == nil, !warnedNoCapture {
                 warnedNoCapture = true
-                dlog("screen capture failed (Screen Recording not allowed?) -> taps in a docked editor will locate too")
+                dlog("screen capture failed (Screen Recording not allowed?) -> taps on track headers and in a docked editor will locate too")
             }
             self.clickRuler(x: d.x, y: w.minY + l.rulerYFromWindowTop, back: now) // cursor goes back to where it is now
         }
-        tapIsBelowEditorDivider(d, in: area, window: w) { belowEditor = .some($0); finish() }
+        classifyTap(d, in: area, window: w, rulerY: w.minY + l.rulerYFromWindowTop) { checked = .some($0); finish() }
         DispatchQueue.main.asyncAfter(deadline: .now() + wait) { waited = true; finish() }
     }
 

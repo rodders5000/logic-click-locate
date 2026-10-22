@@ -76,12 +76,50 @@ func logicMainWindowFrame(topmostAt p: CGPoint, pid: pid_t) -> CGRect? {
 /// at the window's right edge plus six across the right half of the window (the left side may be Library/Inspector);
 /// a row black in all of them is the divider.
 ///
-/// Track headers: at the ruler's height the track-header column is one flat mid-grey block (about 63; reads ~10
-/// brighter through ScreenCaptureKit) ending exactly where the lanes and ruler (45 or darker) start. The Library and
-/// Inspector, when open, sit further left. So the lanes start where the rightmost flat-grey run left of the tap ends;
-/// no such run, or the tap on/inside it, means the tap is on a track header or a side panel (checked 2026-10-22 on
-/// both layouts: runs end at 564 and 1139, the real lane edges).
-enum TapPlace { case lanes, headers, editor }
+/// Track headers: at the ruler's height the track-header column is one long flat grey block (~330 pt) followed by a
+/// darker edge line and the darker ruler, exactly where the lanes start. The Library and Inspector, when open, sit
+/// further left. Absolute colours can't be trusted (ScreenCaptureKit reads ~10 brighter than a screenshot, which put
+/// the ruler inside a fixed "header grey" band and broke locating everywhere, 2026-10-22), so the block is found by
+/// shape: >= 150 pt of one flat neutral grey, then clearly darker within a few points. Lanes start where it ends.
+/// If no such block is found the tap counts as lanes (fail open: locate as before).
+enum TapPlace { case lanes, headers, editor, region }
+
+/// Where the lanes start, from a captured ruler row (RGBA `px`, `scale` pixels per point): the end of the rightmost
+/// header-like block, in pixels, and the block's grey level, or nil if there is none. Taps left of it are on headers
+/// or the Library/Inspector (which can hold shorter flat blocks of its own, so the rightmost block is the header column).
+func lanesLeftEdge(_ px: [UInt8], width rw: Int, row y: Int, scale: CGFloat) -> (end: Int, grey: Int)? {
+    func at(_ x: Int) -> (Int, Bool) { // brightness, neutral grey?
+        let o = (y * rw + x) * 4, r = Int(px[o]), g = Int(px[o + 1]), b = Int(px[o + 2])
+        return (r, max(r, g, b) - min(r, g, b) <= 6)
+    }
+    var blocks: [(end: Int, grey: Int)] = []
+    var x = 0
+    while x < rw {
+        let (v, neutral) = at(x)
+        var e = x + 1
+        if neutral { while e < rw, case let (v2, n2) = at(e), n2, abs(v2 - v) <= 3 { e += 1 } }
+        if neutral, CGFloat(e - x) >= 150 * scale, e < rw {
+            // darker edge line / ruler within a few points after the block
+            let after = (e..<min(rw, e + Int(6 * scale))).map { at($0) }
+            if after.contains(where: { $0.1 && $0.0 <= v - 8 }) { blocks.append((e, v)) }
+        }
+        x = e
+    }
+    return blocks.last
+}
+
+/// Regions vs empty lanes: empty lanes (and folder lanes) are dark and nearly grey, well below the header grey
+/// (live capture 2026-10-22: lanes 45-57, folder lane 51,42,54, header 72); regions are coloured or, for grey
+/// regions, as light as the header. A patch around the tap counts as an empty lane if most of it is lane-like.
+/// (The capture leaves out the mouse pointer.)
+func patchIsEmptyLane(_ px: [UInt8], count n: Int, headerGrey: Int) -> Bool {
+    var lane = 0
+    for i in 0..<n {
+        let o = i * 4, r = Int(px[o]), g = Int(px[o + 1]), b = Int(px[o + 2])
+        if max(r, g, b) - min(r, g, b) <= 15 && max(r, g, b) <= headerGrey - 12 { lane += 1 }
+    }
+    return lane * 2 >= n
+}
 
 /// done(place), or nil if the screen capture failed (e.g. no Screen Recording permission).
 func classifyTap(_ d: CGPoint, in area: CGRect, window w: CGRect, rulerY: CGFloat, done: @escaping (TapPlace?) -> Void) {
@@ -97,48 +135,39 @@ func classifyTap(_ d: CGPoint, in area: CGRect, window w: CGRect, rulerY: CGFloa
 }
 
 func tapPlace(_ d: CGPoint, in area: CGRect, window w: CGRect, rulerY: CGFloat) async throws -> TapPlace {
-    // Track headers / side panels: find the lanes' left edge on the ruler row.
-    let row = try await SCScreenshotManager.captureImage(in: CGRect(x: w.minX, y: rulerY, width: d.x - w.minX, height: 2))
-    let scale = CGFloat(row.width) / (d.x - w.minX)
+    // Track headers / side panels: find the lanes' left edge on the ruler row. The strip runs past the tap so a
+    // header block the tap is inside is seen whole.
+    let stripW = min(w.maxX, d.x + 600) - w.minX
+    let row = try await SCScreenshotManager.captureImage(in: CGRect(x: w.minX, y: rulerY, width: stripW, height: 2))
+    let scale = CGFloat(row.width) / stripW
     let (px, rw, rh) = rgbaPixels(row)
-    var lanesLeft: CGFloat? = nil
-    var runStart: Int? = nil
-    let y = rh / 2
-    for x in 0...rw {
-        var g = false
-        if x < rw {
-            let o = (y * rw + x) * 4
-            let r = px[o], gg = px[o + 1], b = px[o + 2]
-            g = max(r, gg, b) - min(r, gg, b) <= 4 && (60...85).contains(r)
-        }
-        if g, runStart == nil { runStart = x }
-        if !g, let s = runStart {
-            // the ruler's own greys stay under ~13 pt per stretch; the header column is ~330 pt wide
-            if CGFloat(x - s) >= 40 * scale { lanesLeft = w.minX + CGFloat(x) / scale }
-            runStart = nil
-        }
-    }
-    // tap straight below the header grey (however short the stretch so far) = on a header
-    let last = (y * rw + rw - 1) * 4
-    let tapOnGrey = max(px[last], px[last + 1], px[last + 2]) - min(px[last], px[last + 1], px[last + 2]) <= 4
-        && (60...85).contains(px[last])
-    guard !tapOnGrey, let left = lanesLeft, d.x >= left + 3 else {
-        dlog("tap \(pt(d)) -> on track headers/side panel (lanes start at \(lanesLeft.map { "\(Int($0))" } ?? "?"))")
-        return .headers
+    let header = lanesLeftEdge(px, width: rw, row: rh / 2, scale: scale)
+    if let header {
+        let left = w.minX + CGFloat(header.end) / scale
+        if d.x < left + 3 { dlog("tap \(pt(d)) -> on track headers/side panel (lanes start at \(Int(left)))"); return .headers }
+    } else {
+        dlog("tap \(pt(d)) header check: no header block found -> treated as lanes")
     }
 
     // Docked editor/mixer: a black row in every column between the Tracks-area top and the tap.
     let height = d.y - area.minY
-    guard height >= 2 else { return .lanes }
-    let edge = CGRect(x: w.maxX - 3, y: area.minY, width: 2, height: height)
-    let columns = [edge] + (0..<6).map { i in CGRect(x: w.midX + (w.width / 2 - 40) * CGFloat(i) / 5, y: area.minY, width: 2, height: height) }
-    var blackRows: Set<Int>? = nil
-    for rect in columns {
-        let rows = blackRowIndices(try await SCScreenshotManager.captureImage(in: rect))
-        blackRows = blackRows.map { $0.intersection(rows) } ?? rows
-        if blackRows!.isEmpty { break }
+    if height >= 2 {
+        let edge = CGRect(x: w.maxX - 3, y: area.minY, width: 2, height: height)
+        let columns = [edge] + (0..<6).map { i in CGRect(x: w.midX + (w.width / 2 - 40) * CGFloat(i) / 5, y: area.minY, width: 2, height: height) }
+        var blackRows: Set<Int>? = nil
+        for rect in columns {
+            let rows = blackRowIndices(try await SCScreenshotManager.captureImage(in: rect))
+            blackRows = blackRows.map { $0.intersection(rows) } ?? rows
+            if blackRows!.isEmpty { break }
+        }
+        if !(blackRows ?? []).isEmpty { return .editor }
     }
-    return (blackRows ?? []).isEmpty ? .lanes : .editor
+
+    // Region or empty lane: judged against the header grey from the same kind of capture (no header -> lanes).
+    guard let header else { return .lanes }
+    let patch = rgbaPixels(try await SCScreenshotManager.captureImage(in: CGRect(x: d.x - 3, y: d.y - 3, width: 6, height: 6)))
+    if patchIsEmptyLane(patch.0, count: patch.1 * patch.2, headerGrey: header.grey) { return .lanes }
+    return .region
 }
 
 /// The image's pixels as RGBA bytes, with its width and height.
@@ -256,6 +285,7 @@ final class ClickLocator {
             guard self.logicPID() != nil else { dlog("tap \(pt(d)) -> skipped (Logic not frontmost)"); return }
             if place == .editor { dlog("tap \(pt(d)) -> skipped (in the docked editor/mixer)"); return }
             if place == .headers { dlog("tap \(pt(d)) -> skipped (track headers/side panel)"); return }
+            if place == .region { dlog("tap \(pt(d)) -> skipped (on a region)"); return }
             if place == nil, !warnedNoCapture {
                 warnedNoCapture = true
                 dlog("screen capture failed (Screen Recording not allowed?) -> taps on track headers and in a docked editor will locate too")

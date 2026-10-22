@@ -10,6 +10,7 @@
 // (CGWindowList, no accessibility) plus offsets in layout.json.
 
 import Cocoa
+import ScreenCaptureKit
 
 let logicBundleID = "com.apple.logic10"
 let dragSlop: CGFloat = 4
@@ -44,9 +45,9 @@ let layoutURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/LogicClickLocate/layout.json")
 
 /// Logic's main window frame, but only if it is the frontmost window under the point — a plugin window (Logic's
-/// own, floating at layer 3), a separate editor/mixer window or another app's panel on top means no locate.
-/// CGWindowList lists windows front to back; system layers (Dock 20, menu bar 24+, overlays) and invisible
-/// windows are skipped because the Dock's window covers the whole screen.
+/// own, floating at layer 3), an open menu (layer 101), a separate editor/mixer window or another app's panel on
+/// top means no locate. CGWindowList lists windows front to back; the Dock's and Window Server's windows (the Dock
+/// one covers the whole screen) and invisible windows are skipped.
 func logicMainWindowFrame(topmostAt p: CGPoint, pid: pid_t) -> CGRect? {
     guard let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return nil }
     func frame(_ i: [String: Any]) -> CGRect? {
@@ -57,11 +58,61 @@ func logicMainWindowFrame(topmostAt p: CGPoint, pid: pid_t) -> CGRect? {
     let main = infos.filter { (i: [String: Any]) in (i[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid && layer(i) == 0 }
         .compactMap(frame).filter { $0.contains(p) }.max { $0.width * $0.height < $1.width * $1.height }
     let top = infos.first { i in
-        layer(i) < Int(CGWindowLevelForKey(.dockWindow)) && ((i[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0
+        !["Dock", "Window Server"].contains(i[kCGWindowOwnerName as String] as? String ?? "")
+            && ((i[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1) > 0
             && frame(i)?.contains(p) == true
     }
     guard let main, let top, frame(top) == main, (top[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid else { return nil }
     return main
+}
+
+/// Is a docked editor or mixer between the top of the Tracks area and the tap? Logic draws an unbroken black line
+/// above a docked editor/mixer from the left of the track headers to the window's right edge. Region borders are
+/// also black but are broken by the bar grid and stop at the scroll bar, so they never reach the window edge
+/// (checked 2026-10-22 with and without Library/Inspector open). Reads screen pixels (ScreenCaptureKit, needs
+/// Screen Recording) — never accessibility. Thin columns are captured at full resolution (the line is 1 pt): one
+/// at the window's right edge plus six across the right half of the window (the left side may be Library/Inspector);
+/// a row black in all of them is the divider.
+/// done(true) = tap is below the divider, false = no divider above it, nil = capture failed (e.g. no permission).
+func tapIsBelowEditorDivider(_ d: CGPoint, in area: CGRect, window w: CGRect, done: @escaping (Bool?) -> Void) {
+    let height = d.y - area.minY
+    guard height >= 2 else { done(false); return }
+    let edge = CGRect(x: w.maxX - 3, y: area.minY, width: 2, height: height)
+    let columns = [edge] + (0..<6).map { i in CGRect(x: w.midX + (w.width / 2 - 40) * CGFloat(i) / 5, y: area.minY, width: 2, height: height) }
+    Task {
+        do {
+            var blackRows: Set<Int>? = nil
+            var seen: [String] = [] // per column: image height and black-row count, for the log
+            for rect in columns {
+                let img = try await SCScreenshotManager.captureImage(in: rect)
+                let rows = blackRowIndices(img)
+                seen.append("\(img.height)h/\(rows.count)b")
+                blackRows = blackRows.map { $0.intersection(rows) } ?? rows
+                if blackRows!.isEmpty { break }
+            }
+            let found = !(blackRows ?? []).isEmpty
+            if !found { dlog("tap \(pt(d)) editor check: no divider above (columns \(seen.joined(separator: " ")))") }
+            DispatchQueue.main.async { done(found) }
+        } catch {
+            dlog("tap \(pt(d)) editor check: capture error \(error)")
+            DispatchQueue.main.async { done(nil) }
+        }
+    }
+}
+
+/// Rows of the image whose middle pixel is black (or nearly).
+func blackRowIndices(_ img: CGImage) -> Set<Int> {
+    let w = img.width, h = img.height
+    var buf = [UInt8](repeating: 0, count: w * h * 4)
+    guard let ctx = CGContext(data: &buf, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                              space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return [] }
+    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+    var rows = Set<Int>()
+    for r in 0..<h {
+        let o = (r * w + w / 2) * 4
+        if max(buf[o], buf[o + 1], buf[o + 2]) <= 12 { rows.insert(r) }
+    }
+    return rows
 }
 
 // MARK: - Click handling
@@ -133,23 +184,37 @@ final class ClickLocator {
 
     /// Wait out the double-click interval first: locating between the two clicks of a double-click would
     /// put our ruler click in the middle and Logic would never see the double-click (e.g. opening a region).
+    private var warnedNoCapture = false
+
     private func scheduleLocate(at d: CGPoint, back: CGPoint, window w: CGRect) {
         let presses = pressCount
         let wait = max(0.05, min(layout.locateDelay, NSEvent.doubleClickInterval))
-        DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
+        let l = layout
+        let area = CGRect(x: w.minX + l.tracksLeftFromWindowLeft, y: w.minY + l.tracksTopFromWindowTop,
+                          width: w.width - l.tracksLeftFromWindowLeft - l.tracksRightMargin,
+                          height: w.height - l.tracksTopFromWindowTop - l.tracksBottomMargin)
+        guard area.contains(d) else { dlog("tap \(pt(d)) -> skipped (outside Tracks area \(Int(area.minX)),\(Int(area.minY)) \(Int(area.width))x\(Int(area.height)))"); return }
+
+        // The editor check (screen capture) runs during the double-click wait; locate once both are done.
+        var waited = false
+        var belowEditor: Bool?? = .none // .none = capture still running
+        func finish() {
+            guard waited, let below = belowEditor else { return }
             guard self.pressCount == presses else { dlog("tap \(pt(d)) -> cancelled (another click followed)"); return }
             // Moving the mouse during the wait is normal; only a button that is down again stops us.
             guard !CGEventSource.buttonState(.combinedSessionState, button: .left),
                   let now = CGEvent(source: nil)?.location else {
                 dlog("tap \(pt(d)) -> skipped (button pressed again)"); return }
             guard self.logicPID() != nil else { dlog("tap \(pt(d)) -> skipped (Logic not frontmost)"); return }
-            let l = self.layout
-            let area = CGRect(x: w.minX + l.tracksLeftFromWindowLeft, y: w.minY + l.tracksTopFromWindowTop,
-                              width: w.width - l.tracksLeftFromWindowLeft - l.tracksRightMargin,
-                              height: w.height - l.tracksTopFromWindowTop - l.tracksBottomMargin)
-            guard area.contains(d) else { dlog("tap \(pt(d)) -> skipped (outside Tracks area \(Int(area.minX)),\(Int(area.minY)) \(Int(area.width))x\(Int(area.height)))"); return }
+            if below == true { dlog("tap \(pt(d)) -> skipped (in the docked editor/mixer)"); return }
+            if below == nil, !warnedNoCapture {
+                warnedNoCapture = true
+                dlog("screen capture failed (Screen Recording not allowed?) -> taps in a docked editor will locate too")
+            }
             self.clickRuler(x: d.x, y: w.minY + l.rulerYFromWindowTop, back: now) // cursor goes back to where it is now
         }
+        tapIsBelowEditorDivider(d, in: area, window: w) { belowEditor = .some($0); finish() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait) { waited = true; finish() }
     }
 
     private var restorePoint: CGPoint?
@@ -210,6 +275,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // events). That is a local check only: nothing here ever queries Logic through accessibility.
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(opts)
+        // Screen Recording: to see where a docked editor/mixer starts (screen pixels, not Logic's interface).
+        // Without it everything still works, but taps in a docked editor also locate.
+        let canCapture = CGPreflightScreenCaptureAccess()
+        dlog("Screen Recording \(canCapture ? "allowed" : "NOT allowed (asking)")")
+        if !canCapture { CGRequestScreenCaptureAccess() }
         locator.loadLayout()
         startPolling()
     }

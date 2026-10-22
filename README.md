@@ -9,6 +9,7 @@ I built it because in Logic Pro 12.4, Shift-clicking an empty track lane no long
 - It checks the mouse button about 100 times a second while Logic is the front app. It doesn't hook into Logic or into the mouse events.
 - After a **quick, still tap** (no Shift/Cmd/Option/Ctrl) inside the Tracks area, it waits a quarter of a second for a possible second click, then clicks the **ruler** at the same horizontal position and puts your cursor back.
 - **Holds, drags, drag-selecting regions, double-clicks and modifier-clicks are ignored**, so editing works as normal.
+- **Clicks in an editor or mixer docked at the bottom, on plugin windows, or in open menus are ignored too.** It spots a docked editor by the black divider line Logic draws above it, by looking at the screen (that's what the Screen Recording permission is for).
 - It finds the ruler and Tracks area from where Logic's window sits on screen, plus a few offsets you can adjust (see below). It doesn't change or patch Logic in any way.
 
 **Why it never reads Logic's interface:** in Logic 12.4, any app that asks Logic about its interface through macOS Accessibility breaks drag-select and region dragging until Logic is restarted. So this helper deliberately never does that. The cost is that it can't tell an empty lane from a region (see Known limits).
@@ -27,6 +28,7 @@ A menu-bar icon lets you switch it on/off or quit.
    ```
    This builds the app from source, puts it in `~/Applications`, and starts it at every login (it also restarts itself if it ever crashes).
 3. Allow it in **System Settings → Privacy & Security → Accessibility → Logic Click Locate**. macOS needs this for any app that sends a click; the helper uses it only to click the ruler.
+4. Allow it in **System Settings → Privacy & Security → Screen & System Audio Recording → Logic Click Locate**. It only reads a few thin strips of the screen when you click, to see whether you clicked in a docked editor. Without it everything else works, but clicks in a docked editor also move the playhead. macOS may ask you to re-confirm this now and then.
 
 To remove it: `zsh uninstall.sh`.
 
@@ -48,10 +50,10 @@ The defaults were measured on one 3440-wide display with the inspector open. If 
 
 - **A quick tap on a region also moves the playhead** (the region is still selected). To select a region without moving the playhead, hold the click a moment, drag-select it, or Shift-click it.
 - **Showing/hiding the toolbar or panels above the tracks moves the ruler.** Adjust `layout.json` if that happens.
-- **Taps in a mixer or editor docked at the bottom of the main window** also move the playhead.
+- **With the Library or Inspector open, taps on track headers can also move the playhead**, because `tracksLeftFromWindowLeft` no longer matches. Adjust it for the layout you use most.
 - A double-click slower than `locateDelay` won't reach Logic as a double-click.
 - If you run other tools that read Logic's interface through Accessibility (window managers, automation tools), Logic's drag-select can break until you restart Logic. That's Logic, not this helper.
-- After reinstalling, remove the old Accessibility entry and allow it again (each local build has a new signature).
+- After reinstalling, remove the old Accessibility and Screen Recording entries and allow them again (each local build has a new signature).
 
 Tested on Logic Pro 12.4, macOS 26, Apple silicon.
 
